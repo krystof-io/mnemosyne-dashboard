@@ -4,18 +4,26 @@ import argparse
 import json
 import mimetypes
 import os
+import sqlite3
 import subprocess
 import time
 import tomllib
 import urllib.parse
+from contextlib import closing
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import sqlite3
-
-from config import auth_cookie_value, data_dir, effective_config, hermes_home, public_config, save_config, verify_password
+from config import (
+    auth_cookie_value,
+    data_dir,
+    effective_config,
+    hermes_home,
+    public_config,
+    save_config,
+    verify_password,
+)
 from dashboard_core import DashboardStore, default_db_path
 
 ROOT = Path(__file__).parent
@@ -28,14 +36,16 @@ MAX_JSON_BODY_BYTES = 64 * 1024
 # The default profile keeps memories in the top-level DB; isolated profiles
 # store them in a per-profile bank sub-DB.
 
+PROBE_TIMEOUT_SECONDS = 10
+
+
 def _count_working_memory(db_path: Path) -> int:
     """Quick SELECT COUNT(*) FROM working_memory, returns 0 on any error."""
     try:
         uri = f"file:{db_path}?mode=ro"
-        con = sqlite3.connect(uri, uri=True, timeout=3)
-        row = con.execute("SELECT count(*) FROM working_memory").fetchone()
-        con.close()
-        return int(row[0]) if row else 0
+        with closing(sqlite3.connect(uri, uri=True, timeout=PROBE_TIMEOUT_SECONDS)) as con:
+            row = con.execute("SELECT count(*) FROM working_memory").fetchone()
+            return int(row[0]) if row else 0
     except Exception:
         return 0
 
@@ -46,10 +56,9 @@ def _is_valid_mnemosyne_db(db_path: Path) -> bool:
         return False
     try:
         uri = f"file:{db_path}?mode=ro"
-        con = sqlite3.connect(uri, uri=True, timeout=3)
-        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        con.close()
-        return "working_memory" in tables
+        with closing(sqlite3.connect(uri, uri=True, timeout=PROBE_TIMEOUT_SECONDS)) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            return "working_memory" in tables
     except Exception:
         return False
 
@@ -62,10 +71,11 @@ def _hermes_root() -> Path:
     # If home contains a 'profiles' dir, it's the real root.
     if (home / "profiles").is_dir():
         return home
-    # If home looks like ~/.hermes/profiles/<name>, go up two levels.
-    if home.parent.name == "profiles" and home.parent.parent.name == ".hermes":
+    # If home looks like <root>/profiles/<name>, climb back to the root that
+    # owns the profiles dir (works for custom roots, not just ~/.hermes).
+    if home.parent.name == "profiles" and (home.parent.parent / "profiles").is_dir():
         return home.parent.parent
-    # Fallback: check if HERMES_HOME itself is ~/.hermes
+    # Fallback: HERMES_HOME is the root itself.
     return home
 
 
@@ -74,37 +84,59 @@ def discover_profiles() -> list[dict[str, Any]]:
 
     Returns a list of {name, db_path, size_bytes, memory_count} dicts,
     sorted by name. Discovery is generic — no hardcoded profile names.
+
+    Layouts probed (a candidate must be a valid Mnemosyne DB to be included):
+      L1  <root>/mnemosyne/data/mnemosyne.db                                  -> "default"
+      L4  <root>/mnemosyne/data/banks/<bank>/mnemosyne.db                     -> <bank>
+      L3  <root>/profiles/<p>/mnemosyne/data/mnemosyne.db                     -> <p>
+      L2  <root>/profiles/<p>/mnemosyne/data/banks/<bank>/mnemosyne.db        -> <bank>
+
+    The shared DB (<root>/data/shared/mnemosyne.db) is cross-profile state and
+    deliberately matches none of the patterns above.
     """
     home = _hermes_root()
     profiles: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
 
-    # 1. Default profile DB (top-level, no bank isolation)
-    default_db = home / "mnemosyne" / "data" / "mnemosyne.db"
-    if _is_valid_mnemosyne_db(default_db):
+    def add(name: str, db_path: Path) -> None:
+        if not name or not _is_valid_mnemosyne_db(db_path):
+            return
+        key = str(db_path.resolve())
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
         profiles.append({
-            "name": "default",
-            "db_path": str(default_db),
-            "size_bytes": default_db.stat().st_size,
-            "memory_count": _count_working_memory(default_db),
+            "name": name,
+            "db_path": str(db_path),
+            "size_bytes": db_path.stat().st_size,
+            "memory_count": _count_working_memory(db_path),
         })
 
-    # 2. Isolated profile bank DBs: ~/.hermes/profiles/<profile>/mnemosyne/data/banks/<profile>/mnemosyne.db
+    # L1 — default profile DB (top-level, no bank isolation).
+    add("default", home / "mnemosyne" / "data" / "mnemosyne.db")
+
+    # L4 — top-level bank DBs: <root>/mnemosyne/data/banks/<bank>/mnemosyne.db
+    top_level_banks = home / "mnemosyne" / "data" / "banks"
+    if top_level_banks.is_dir():
+        for bank in sorted(top_level_banks.iterdir()):
+            if bank.is_dir():
+                add(bank.name, bank / "mnemosyne.db")
+
     profiles_dir = home / "profiles"
     if profiles_dir.is_dir():
         for entry in sorted(profiles_dir.iterdir()):
             if not entry.is_dir():
                 continue
-            profile_name = entry.name
-            bank_db = entry / "mnemosyne" / "data" / "banks" / profile_name / "mnemosyne.db"
-            if _is_valid_mnemosyne_db(bank_db):
-                profiles.append({
-                    "name": profile_name,
-                    "db_path": str(bank_db),
-                    "size_bytes": bank_db.stat().st_size,
-                    "memory_count": _count_working_memory(bank_db),
-                })
+            # L3 — profile direct DB: <root>/profiles/<p>/mnemosyne/data/mnemosyne.db
+            add(entry.name, entry / "mnemosyne" / "data" / "mnemosyne.db")
+            # L2 — profile bank DBs: <root>/profiles/<p>/mnemosyne/data/banks/<bank>/mnemosyne.db
+            profile_banks = entry / "mnemosyne" / "data" / "banks"
+            if profile_banks.is_dir():
+                for bank in sorted(profile_banks.iterdir()):
+                    if bank.is_dir():
+                        add(bank.name, bank / "mnemosyne.db")
 
-    return profiles
+    return sorted(profiles, key=lambda p: (p["name"].lower(), p["db_path"]))
 
 
 def _project_version() -> str:
@@ -536,6 +568,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_auth(path):
                 return
             if path == "/api/profile/switch":
+                if not self._require_admin():
+                    return
                 name = str(body.get("name") or "").strip()
                 if not name:
                     return self._send_json({"ok": False, "error": "profile name required"}, 400)

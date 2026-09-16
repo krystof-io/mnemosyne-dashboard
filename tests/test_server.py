@@ -28,10 +28,13 @@ def _request(url: str, method: str = "GET", body: dict[str, Any] | None = None, 
 
 
 class ServerHarness:
-    def __init__(self, tmp_path: Path, monkeypatch):
-        self.db = tmp_path / "mnemosyne.db"
-        make_db(self.db)
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    def __init__(self, tmp_path: Path, monkeypatch, db: Path | None = None, hermes_home: Path | None = None):
+        self.db = db if db is not None else tmp_path / "mnemosyne.db"
+        if db is None:
+            make_db(self.db)
+        self.hermes_home = hermes_home if hermes_home is not None else tmp_path / "hermes"
+        self.hermes_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(self.hermes_home))
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.httpd.db_path = self.db
         self.httpd.bind_host = "127.0.0.1"

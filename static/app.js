@@ -92,11 +92,16 @@ async function switchProfile(name, { skipReload=false } = {}){
       localStorage.setItem(PROFILE_KEY, name);
       updateProfileBadge();
       if(!skipReload){
+        // Reset the client realtime ring so old-profile events don't intermix
+        // with the new profile's stream (the EventSource already follows the
+        // active DB server-side per tick, so no re-init is needed).
+        realtimeState.events = [];
+        renderRealtimeEvents();
         // Reload all current tab data — same as bootstrap but without re-checking auth
         await loadStats();
-        const section = document.querySelector('.tab.active')?.id || 'overview';
-        if(section === 'overview') { /* loadStats already loaded overview */ }
-        else switchTab(section, { push:false });
+        const tab = (currentRoute && currentRoute.tab) || 'overview';
+        if(tab === 'overview') { /* loadStats already loaded overview */ }
+        else switchTab(tab, { push:false });
       }
     }
   } catch(e) {
