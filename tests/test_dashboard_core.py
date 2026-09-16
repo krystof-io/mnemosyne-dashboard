@@ -954,6 +954,17 @@ def test_static_ui_exposes_v23_trust_and_lifecycle_controls():
     assert '.lifecycle-cold' in css
 
 
+def test_dark_mode_declares_color_scheme_and_themes_select_options():
+    html = (ROOT / 'static' / 'index.html').read_text()
+    css = (ROOT / 'static' / 'style.css').read_text()
+
+    assert 'color-scheme: dark' in css
+    assert 'color-scheme: light' in css
+    assert 'option{' in css
+    assert 'option:checked{' in css
+    assert '<meta name="color-scheme" content="dark light" />' in html
+
+
 def test_public_config_reports_lan_url_for_wildcard_bind(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes'))
     monkeypatch.setattr('config.lan_host', lambda: '192.168.1.160')
